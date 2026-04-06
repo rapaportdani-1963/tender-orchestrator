@@ -1,0 +1,649 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Tender Orchestrator</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🤖</text></svg>" />
+  <link rel="manifest" href="manifest.json" />
+  <meta name="theme-color" content="#0B0F1A" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="description" content="מערכת ניהול מכרזים אוטומטית — Tender Orchestrator" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #0B0F1A; font-family: 'Segoe UI', Tahoma, sans-serif; }
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: #0F172A; }
+    ::-webkit-scrollbar-thumb { background: #312E81; border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: #4338CA; }
+    input:focus, select:focus { border-color: #6366F1 !important; outline: none; }
+    @keyframes pulse { 0%,100% { opacity:1; transform:scale(1); } 50% { opacity:.5; transform:scale(1.1); } }
+    @keyframes fadeIn { from { opacity:0; transform:translateY(8px); } to { opacity:1; transform:translateY(0); } }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useEffect, useCallback } = React;
+
+    /* ─── STORAGE ─── */
+    const STORAGE_KEY = "tender_orchestrator_config";
+    const DEFAULT_CONFIG = {
+      tenderDbId: "",
+      tenderDbGids: { tenders: "", items: "", suppliers: "", products: "", discounts: "" },
+      trainingLogId: "",
+      trainingLogGids: { mail_agent: "", research_agent: "", pricing_agent: "" },
+      claudeApiKey: "",
+      claudeModel: "claude-sonnet-4-20250514",
+      userName: "",
+      userEmail: "",
+    };
+
+    function loadConfig() {
+      try {
+        const saved = localStorage.getItem(STORAGE_KEY);
+        if (saved) return { ...DEFAULT_CONFIG, ...JSON.parse(saved) };
+      } catch {}
+      return DEFAULT_CONFIG;
+    }
+
+    function saveConfig(cfg) {
+      try { localStorage.setItem(STORAGE_KEY, JSON.stringify(cfg)); } catch {}
+    }
+
+    /* ─── CSV PARSER ─── */
+    function parseCSV(text) {
+      if (!text || !text.trim()) return { headers: [], rows: [] };
+      const lines = []; let cur = "", inQ = false;
+      for (let i = 0; i < text.length; i++) {
+        const c = text[i];
+        if (c === '"') { if (inQ && text[i+1] === '"') { cur += '"'; i++; } else inQ = !inQ; }
+        else if (c === "\n" && !inQ) { lines.push(cur); cur = ""; }
+        else cur += c;
+      }
+      if (cur.trim()) lines.push(cur);
+      const split = (line) => {
+        const cells = []; let cell = "", q = false;
+        for (let i = 0; i < line.length; i++) {
+          const c = line[i];
+          if (c === '"') { if (q && line[i+1] === '"') { cell += '"'; i++; } else q = !q; }
+          else if (c === "," && !q) { cells.push(cell); cell = ""; }
+          else cell += c;
+        }
+        cells.push(cell); return cells;
+      };
+      const headers = split(lines[0] || "").map(h => h.trim()).filter(h => h);
+      const rows = lines.slice(1).filter(l => l.trim()).map(l => {
+        const cells = split(l); const obj = {};
+        headers.forEach((h, i) => { obj[h] = (cells[i] || "").trim(); });
+        return obj;
+      }).filter(r => Object.values(r).some(v => v !== ""));
+      return { headers, rows };
+    }
+
+    /* ─── FETCH ─── */
+    async function fetchSheet(id, gid) {
+      const url = `https://docs.google.com/spreadsheets/d/${id}/gviz/tq?tqx=out:csv&gid=${gid}`;
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return parseCSV(await res.text());
+    }
+
+    /* ─── COMPONENTS ─── */
+    function Badge({ value, type }) {
+      const statusMap = {
+        new: { bg: "#FEF3C7", fg: "#92400E", l: "חדש" },
+        "חדש": { bg: "#FEF3C7", fg: "#92400E", l: "חדש" },
+        "נלמד": { bg: "#D1FAE5", fg: "#065F46", l: "נלמד" },
+        "חוזר": { bg: "#FEE2E2", fg: "#991B1B", l: "חוזר" },
+        researched: { bg: "#DBEAFE", fg: "#1E40AF", l: "נחקר" },
+        priced: { bg: "#E0E7FF", fg: "#3730A3", l: "תומחר" },
+        approved: { bg: "#ECFDF5", fg: "#047857", l: "מאושר" },
+        sent: { bg: "#F0FDF4", fg: "#166534", l: "נשלח" },
+      };
+      const sevMap = {
+        "קריטי": { bg: "#FEE2E2", fg: "#991B1B" },
+        "חשוב": { bg: "#FEF3C7", fg: "#92400E" },
+        "קל": { bg: "#DBEAFE", fg: "#1E40AF" },
+      };
+      const map = type === "severity" ? sevMap : statusMap;
+      const s = map[value] || { bg: "#1E293B", fg: "#94A3B8", l: value || "—" };
+      return React.createElement("span", {
+        style: {
+          background: s.bg, color: s.fg, padding: "3px 10px", borderRadius: "12px",
+          fontSize: "11px", fontWeight: 700, whiteSpace: "nowrap", display: "inline-block",
+        }
+      }, s.l || value || "—");
+    }
+
+    function DeadlineCell({ value }) {
+      if (!value) return React.createElement("span", { style: { color: "#475569" } }, "—");
+      const diff = Math.ceil((new Date(value) - new Date()) / 86400000);
+      const s = diff < 0 ? { c: "#EF4444", i: "🔴" }
+        : diff <= 2 ? { c: "#F59E0B", i: "🟡" }
+        : diff <= 7 ? { c: "#3B82F6", i: "🔵" }
+        : { c: "#10B981", i: "🟢" };
+      return React.createElement("span", {
+        style: { color: s.c, fontWeight: 600, fontSize: "12px" }
+      }, `${s.i} ${value} ${diff >= 0 ? `(${diff} ימים)` : "(עבר!)"}`);
+    }
+
+    function DataTable({ data }) {
+      if (!data?.headers?.length) {
+        return React.createElement("div", {
+          style: { textAlign: "center", padding: "50px", color: "#64748B" }
+        },
+          React.createElement("div", { style: { fontSize: "36px", marginBottom: "10px" } }, "📭"),
+          React.createElement("p", null, "אין נתונים זמינים"),
+          data?.error && React.createElement("p", { style: { fontSize: "12px", color: "#EF4444" } }, data.error)
+        );
+      }
+      const isStatus = h => h.includes("סטטוס") || h.toLowerCase().includes("status");
+      const isSev = h => h.includes("חומרה");
+      const isDead = h => h.includes("דדליין") || h.toLowerCase().includes("deadline");
+      const isKey = h => h.includes("מזהה") || h.includes("לקוח") || h.includes("קטגוריה");
+
+      return React.createElement("div", {
+        style: { overflowX: "auto", borderRadius: "10px", border: "1px solid #1E293B" }
+      },
+        React.createElement("table", {
+          style: { width: "100%", borderCollapse: "collapse", fontSize: "13px" }
+        },
+          React.createElement("thead", null,
+            React.createElement("tr", null,
+              data.headers.map((h, i) =>
+                React.createElement("th", {
+                  key: i,
+                  style: {
+                    background: "#0F172A", padding: "11px 14px", textAlign: "right",
+                    color: "#818CF8", fontWeight: 700, fontSize: "12px",
+                    borderBottom: "2px solid #312E81", whiteSpace: "nowrap",
+                  }
+                }, h)
+              )
+            )
+          ),
+          React.createElement("tbody", null,
+            data.rows.map((row, ri) =>
+              React.createElement("tr", {
+                key: ri,
+                style: { background: ri % 2 === 0 ? "#0F172A88" : "#1E293B55", cursor: "default" },
+                onMouseEnter: e => e.currentTarget.style.background = "#312E8133",
+                onMouseLeave: e => e.currentTarget.style.background = ri % 2 === 0 ? "#0F172A88" : "#1E293B55",
+              },
+                data.headers.map((h, ci) =>
+                  React.createElement("td", {
+                    key: ci,
+                    style: {
+                      padding: "10px 14px", borderBottom: "1px solid #1E293B22",
+                      color: isKey(h) ? "#E2E8F0" : "#94A3B8",
+                      fontWeight: isKey(h) ? 600 : 400,
+                      maxWidth: "280px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                    }
+                  },
+                    isStatus(h) ? React.createElement(Badge, { value: row[h] }) :
+                    isSev(h) ? React.createElement(Badge, { value: row[h], type: "severity" }) :
+                    isDead(h) ? React.createElement(DeadlineCell, { value: row[h] }) :
+                    row[h] || React.createElement("span", { style: { color: "#334155" } }, "—")
+                  )
+                )
+              )
+            )
+          )
+        )
+      );
+    }
+
+    function StatCard({ icon, label, value, color }) {
+      return React.createElement("div", {
+        style: {
+          flex: "1", minWidth: "100px",
+          background: "linear-gradient(145deg, #1E293B, #0F172A)",
+          border: `1px solid ${color}33`, borderRadius: "12px",
+          padding: "14px 12px", textAlign: "center",
+          animation: "fadeIn 0.4s ease",
+        }
+      },
+        React.createElement("div", { style: { fontSize: "20px" } }, icon),
+        React.createElement("div", { style: { fontSize: "26px", fontWeight: 800, color, marginTop: "2px" } }, value),
+        React.createElement("div", { style: { fontSize: "10px", color: "#64748B", marginTop: "2px" } }, label)
+      );
+    }
+
+    /* ─── SETTINGS SCREEN ─── */
+    function SettingsScreen({ config, onSave, onClose }) {
+      const [local, setLocal] = useState({ ...config });
+      const [testStatus, setTestStatus] = useState({});
+      const [showKey, setShowKey] = useState(false);
+
+      const update = (key, val) => setLocal(p => ({ ...p, [key]: val }));
+      const updateGid = (group, key, val) => setLocal(p => ({
+        ...p, [group]: { ...p[group], [key]: val }
+      }));
+      const extractId = (url) => { const m = url.match(/\/d\/([a-zA-Z0-9_-]+)/); return m ? m[1] : url; };
+
+      const testSheet = async (id, gid, label) => {
+        if (!id) return;
+        setTestStatus(p => ({ ...p, [label]: "testing" }));
+        try {
+          const data = await fetchSheet(id, gid || "0");
+          setTestStatus(p => ({ ...p, [label]: data.rows.length > 0 ? "ok" : "empty" }));
+        } catch { setTestStatus(p => ({ ...p, [label]: "error" })); }
+      };
+
+      const testClaude = async () => {
+        if (!local.claudeApiKey) return;
+        setTestStatus(p => ({ ...p, claude: "testing" }));
+        try {
+          const res = await fetch("https://api.anthropic.com/v1/messages", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "x-api-key": local.claudeApiKey,
+              "anthropic-version": "2023-06-01",
+              "anthropic-dangerous-direct-browser-access": "true",
+            },
+            body: JSON.stringify({
+              model: local.claudeModel, max_tokens: 50,
+              messages: [{ role: "user", content: "respond with: ok" }],
+            }),
+          });
+          const data = await res.json();
+          setTestStatus(p => ({ ...p, claude: data.content ? "ok" : "error" }));
+        } catch { setTestStatus(p => ({ ...p, claude: "error" })); }
+      };
+
+      const statusIcon = (key) => {
+        const s = testStatus[key];
+        if (s === "testing") return React.createElement("span", { style: { color: "#F59E0B", fontSize: "11px" } }, "⏳ בודק...");
+        if (s === "ok") return React.createElement("span", { style: { color: "#10B981", fontSize: "11px" } }, "✅ תקין");
+        if (s === "empty") return React.createElement("span", { style: { color: "#F59E0B", fontSize: "11px" } }, "⚠️ ריק");
+        if (s === "error") return React.createElement("span", { style: { color: "#EF4444", fontSize: "11px" } }, "❌ שגיאה");
+        return null;
+      };
+
+      const inputStyle = {
+        width: "100%", padding: "9px 12px", borderRadius: "8px",
+        border: "1px solid #312E81", background: "#0F172A",
+        color: "#E2E8F0", fontSize: "13px", direction: "ltr", boxSizing: "border-box",
+      };
+      const labelStyle = { fontSize: "12px", color: "#94A3B8", display: "block", marginBottom: "4px", fontWeight: 600 };
+      const sectionStyle = { background: "#1E293B44", border: "1px solid #1E293B", borderRadius: "12px", padding: "20px", marginBottom: "16px" };
+      const btnStyle = (bg) => ({ background: bg, border: "none", color: "#fff", padding: "7px 16px", borderRadius: "8px", cursor: "pointer", fontSize: "12px", fontWeight: 600 });
+
+      return React.createElement("div", {
+        style: { position: "fixed", inset: 0, background: "#0B0F1Aee", zIndex: 1000, overflowY: "auto", padding: "20px" }
+      },
+        React.createElement("div", { style: { maxWidth: "650px", margin: "0 auto" } },
+
+          /* Header */
+          React.createElement("div", {
+            style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "20px" }
+          },
+            React.createElement("h2", { style: { fontSize: "20px", color: "#C7D2FE", fontWeight: 800 } }, "⚙️ הגדרות מערכת"),
+            React.createElement("button", {
+              onClick: onClose,
+              style: { background: "none", border: "1px solid #334155", color: "#94A3B8", padding: "6px 14px", borderRadius: "8px", cursor: "pointer", fontSize: "13px" }
+            }, "✕ סגור")
+          ),
+
+          /* User Info */
+          React.createElement("div", { style: sectionStyle },
+            React.createElement("h3", { style: { margin: "0 0 14px", fontSize: "15px", color: "#A5B4FC" } }, "👤 פרטי משתמש"),
+            React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: "12px" } },
+              React.createElement("div", null,
+                React.createElement("label", { style: labelStyle }, "שם"),
+                React.createElement("input", { value: local.userName, onChange: e => update("userName", e.target.value), placeholder: "הכנס שם", style: inputStyle })
+              ),
+              React.createElement("div", null,
+                React.createElement("label", { style: labelStyle }, "אימייל"),
+                React.createElement("input", { value: local.userEmail, onChange: e => update("userEmail", e.target.value), placeholder: "user@example.com", style: inputStyle })
+              )
+            )
+          ),
+
+          /* Tender DB */
+          React.createElement("div", { style: sectionStyle },
+            React.createElement("h3", { style: { margin: "0 0 14px", fontSize: "15px", color: "#A5B4FC" } }, "📋 מסד נתוני מכרזים"),
+            React.createElement("div", { style: { marginBottom: "12px" } },
+              React.createElement("label", { style: labelStyle }, "קישור או ID של הגיליון"),
+              React.createElement("div", { style: { display: "flex", gap: "8px" } },
+                React.createElement("input", {
+                  value: local.tenderDbId,
+                  onChange: e => update("tenderDbId", extractId(e.target.value)),
+                  placeholder: "הדבק קישור Google Sheets או ID", style: { ...inputStyle, flex: 1 }
+                }),
+                React.createElement("button", {
+                  onClick: () => testSheet(local.tenderDbId, local.tenderDbGids.tenders || "0", "tenderDb"),
+                  style: btnStyle("#6366F1")
+                }, "🧪 בדוק")
+              ),
+              React.createElement("div", { style: { marginTop: "4px" } }, statusIcon("tenderDb"))
+            ),
+            React.createElement("p", { style: { fontSize: "11px", color: "#64748B", margin: "0 0 10px" } }, "GID של כל גיליון (נמצא בכתובת אחרי gid=)"),
+            React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px" } },
+              [{ key: "tenders", label: "מכרזים" }, { key: "items", label: "פריטי מכרז" }, { key: "suppliers", label: "ספקים" }, { key: "products", label: "מוצרים" }, { key: "discounts", label: "טבלת הנחות" }].map(s =>
+                React.createElement("div", { key: s.key },
+                  React.createElement("label", { style: { ...labelStyle, fontSize: "11px" } }, s.label),
+                  React.createElement("input", {
+                    value: local.tenderDbGids[s.key] || "",
+                    onChange: e => updateGid("tenderDbGids", s.key, e.target.value),
+                    placeholder: "GID", style: { ...inputStyle, padding: "7px 10px", fontSize: "12px" }
+                  })
+                )
+              )
+            )
+          ),
+
+          /* Training Log */
+          React.createElement("div", { style: sectionStyle },
+            React.createElement("h3", { style: { margin: "0 0 14px", fontSize: "15px", color: "#A5B4FC" } }, "📓 יומן הדרכה"),
+            React.createElement("div", { style: { marginBottom: "12px" } },
+              React.createElement("label", { style: labelStyle }, "קישור או ID של הגיליון"),
+              React.createElement("div", { style: { display: "flex", gap: "8px" } },
+                React.createElement("input", {
+                  value: local.trainingLogId,
+                  onChange: e => update("trainingLogId", extractId(e.target.value)),
+                  placeholder: "הדבק קישור Google Sheets או ID", style: { ...inputStyle, flex: 1 }
+                }),
+                React.createElement("button", {
+                  onClick: () => testSheet(local.trainingLogId, local.trainingLogGids.mail_agent || "0", "trainingLog"),
+                  style: btnStyle("#6366F1")
+                }, "🧪 בדוק")
+              ),
+              React.createElement("div", { style: { marginTop: "4px" } }, statusIcon("trainingLog"))
+            ),
+            React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "8px" } },
+              [{ key: "mail_agent", label: "סוכן דואר" }, { key: "research_agent", label: "סוכן מחקר" }, { key: "pricing_agent", label: "סוכן מתמחר" }].map(s =>
+                React.createElement("div", { key: s.key },
+                  React.createElement("label", { style: { ...labelStyle, fontSize: "11px" } }, s.label),
+                  React.createElement("input", {
+                    value: local.trainingLogGids[s.key] || "",
+                    onChange: e => updateGid("trainingLogGids", s.key, e.target.value),
+                    placeholder: "GID", style: { ...inputStyle, padding: "7px 10px", fontSize: "12px" }
+                  })
+                )
+              )
+            )
+          ),
+
+          /* Claude API */
+          React.createElement("div", { style: sectionStyle },
+            React.createElement("h3", { style: { margin: "0 0 14px", fontSize: "15px", color: "#A5B4FC" } }, "🤖 חשבון Claude — הגדרות API"),
+            React.createElement("p", { style: { fontSize: "11px", color: "#64748B", margin: "0 0 12px" } },
+              "מפתח ה-API מאפשר לדשבורד להפעיל סוכנים אוטומטית. ניתן ליצור מפתח ב-",
+              React.createElement("a", { href: "https://console.anthropic.com/settings/keys", target: "_blank", style: { color: "#818CF8", marginRight: "4px" } }, "console.anthropic.com")
+            ),
+            React.createElement("div", { style: { marginBottom: "12px" } },
+              React.createElement("label", { style: labelStyle }, "API Key"),
+              React.createElement("div", { style: { display: "flex", gap: "8px" } },
+                React.createElement("div", { style: { position: "relative", flex: 1 } },
+                  React.createElement("input", {
+                    type: showKey ? "text" : "password",
+                    value: local.claudeApiKey,
+                    onChange: e => update("claudeApiKey", e.target.value),
+                    placeholder: "sk-ant-api03-...", style: inputStyle
+                  }),
+                  React.createElement("button", {
+                    onClick: () => setShowKey(!showKey),
+                    style: { position: "absolute", left: "8px", top: "50%", transform: "translateY(-50%)", background: "none", border: "none", color: "#64748B", cursor: "pointer", fontSize: "14px" }
+                  }, showKey ? "🙈" : "👁")
+                ),
+                React.createElement("button", { onClick: testClaude, style: btnStyle("#8B5CF6") }, "🧪 בדוק")
+              ),
+              React.createElement("div", { style: { marginTop: "4px" } }, statusIcon("claude"))
+            ),
+            React.createElement("div", null,
+              React.createElement("label", { style: labelStyle }, "מודל"),
+              React.createElement("select", {
+                value: local.claudeModel,
+                onChange: e => update("claudeModel", e.target.value),
+                style: { ...inputStyle, cursor: "pointer" }
+              },
+                React.createElement("option", { value: "claude-sonnet-4-20250514" }, "Claude Sonnet 4 (מומלץ)"),
+                React.createElement("option", { value: "claude-haiku-4-5-20251001" }, "Claude Haiku 4.5 (מהיר)"),
+                React.createElement("option", { value: "claude-opus-4-6" }, "Claude Opus 4.6 (חזק)")
+              )
+            )
+          ),
+
+          /* Help */
+          React.createElement("div", { style: { ...sectionStyle, background: "#312E8115", border: "1px solid #312E8144" } },
+            React.createElement("h3", { style: { margin: "0 0 10px", fontSize: "14px", color: "#818CF8" } }, "💡 איך מגדירים"),
+            React.createElement("div", { style: { fontSize: "12px", color: "#94A3B8", lineHeight: "1.8" } },
+              React.createElement("p", { style: { margin: "0 0 6px" } },
+                React.createElement("strong", { style: { color: "#C7D2FE" } }, "Google Sheets: "),
+                "הדבק את הכתובת המלאה של הגיליון — ה-ID יישלף אוטומטית. ודא שהגיליון משותף ל\"כל מי שיש לו קישור\"."
+              ),
+              React.createElement("p", { style: { margin: "0 0 6px" } },
+                React.createElement("strong", { style: { color: "#C7D2FE" } }, "GID: "),
+                "כל טאב בגיליון מקבל מספר GID. כשאתה לוחץ על טאב, המספר מופיע בכתובת אחרי \"gid=\"."
+              ),
+              React.createElement("p", { style: { margin: 0 } },
+                React.createElement("strong", { style: { color: "#C7D2FE" } }, "Claude API: "),
+                "היכנס ל-console.anthropic.com, צור מפתח API חדש, והדבק כאן. כל משתמש צריך מפתח משלו."
+              )
+            )
+          ),
+
+          /* Save */
+          React.createElement("div", { style: { display: "flex", gap: "10px", justifyContent: "flex-end", paddingBottom: "40px" } },
+            React.createElement("button", {
+              onClick: onClose,
+              style: { ...btnStyle("transparent"), border: "1px solid #334155", color: "#94A3B8" }
+            }, "ביטול"),
+            React.createElement("button", {
+              onClick: () => { saveConfig(local); onSave(local); onClose(); },
+              style: { ...btnStyle("linear-gradient(135deg, #6366F1, #8B5CF6)"), padding: "10px 28px", fontSize: "14px" }
+            }, "💾 שמור הגדרות")
+          )
+        )
+      );
+    }
+
+    /* ─── MAIN APP ─── */
+    function App() {
+      const [config, setConfig] = useState(loadConfig);
+      const [tender, setTender] = useState({});
+      const [training, setTraining] = useState({});
+      const [loading, setLoading] = useState(false);
+      const [error, setError] = useState(null);
+      const [tab, setTab] = useState("summary");
+      const [updated, setUpdated] = useState(null);
+      const [showSettings, setShowSettings] = useState(false);
+      const [firstLoad, setFirstLoad] = useState(true);
+
+      const load = useCallback(async (cfg) => {
+        const c = cfg || config;
+        if (!c.tenderDbId && !c.trainingLogId) { setFirstLoad(true); return; }
+        setLoading(true); setError(null); setFirstLoad(false);
+        try {
+          const tResults = {};
+          for (const [key, gid] of Object.entries(c.tenderDbGids)) {
+            if (!gid || !c.tenderDbId) continue;
+            try { const d = await fetchSheet(c.tenderDbId, gid); if (d.headers.length) tResults[key] = d; }
+            catch (e) { tResults[key] = { headers: [], rows: [], error: e.message }; }
+          }
+          const trResults = {};
+          for (const [key, gid] of Object.entries(c.trainingLogGids)) {
+            if (!gid || !c.trainingLogId) continue;
+            try { const d = await fetchSheet(c.trainingLogId, gid); if (d.headers.length) trResults[key] = d; }
+            catch (e) { trResults[key] = { headers: [], rows: [], error: e.message }; }
+          }
+          setTender(tResults); setTraining(trResults);
+          setUpdated(new Date().toLocaleTimeString("he-IL"));
+        } catch (e) { setError(e.message); }
+        setLoading(false);
+      }, [config]);
+
+      useEffect(() => { load(); }, []);
+
+      const handleSave = (newCfg) => { setConfig(newCfg); load(newCfg); };
+
+      const tabs = [
+        { key: "summary", label: "סיכום", icon: "📊" },
+        { key: "tenders", label: "מכרזים", icon: "📋", data: () => tender.tenders },
+        { key: "items", label: "פריטי מכרז", icon: "📦", data: () => tender.items },
+        { key: "suppliers", label: "ספקים", icon: "🏭", data: () => tender.suppliers },
+        { key: "products", label: "מוצרים", icon: "🔧", data: () => tender.products },
+        { key: "discounts", label: "הנחות", icon: "💰", data: () => tender.discounts },
+        { key: "mail_agent", label: "סוכן דואר", icon: "📧", data: () => training.mail_agent },
+        { key: "research_agent", label: "סוכן מחקר", icon: "🔍", data: () => training.research_agent },
+        { key: "pricing_agent", label: "סוכן מתמחר", icon: "💹", data: () => training.pricing_agent },
+      ];
+
+      const tenders = tender.tenders?.rows || [];
+      const lessons = training.mail_agent?.rows || [];
+      const newCount = tenders.filter(r => (r["סטטוס"]||"").toLowerCase() === "new").length;
+      const urgentCount = tenders.filter(r => {
+        if (!r["דדליין"]) return false;
+        return Math.ceil((new Date(r["דדליין"]) - new Date()) / 86400000) <= 3;
+      }).length;
+      const openLessons = lessons.filter(r => r["סטטוס"] === "חדש" || r["סטטוס"] === "חוזר").length;
+
+      return React.createElement("div", {
+        dir: "rtl",
+        style: { fontFamily: "'Segoe UI', Tahoma, sans-serif", minHeight: "100vh", background: "#0B0F1A", color: "#E2E8F0" }
+      },
+        showSettings && React.createElement(SettingsScreen, { config, onSave: handleSave, onClose: () => setShowSettings(false) }),
+
+        /* HEADER */
+        React.createElement("header", {
+          style: {
+            background: "linear-gradient(90deg, #0F172A, #1a1040, #0F172A)",
+            borderBottom: "1px solid #312E81", padding: "14px 20px",
+            display: "flex", alignItems: "center", justifyContent: "space-between",
+          }
+        },
+          React.createElement("div", { style: { display: "flex", alignItems: "center", gap: "12px" } },
+            React.createElement("div", {
+              style: {
+                width: "40px", height: "40px", borderRadius: "10px",
+                background: "linear-gradient(135deg, #6366F1, #A855F7)",
+                display: "flex", alignItems: "center", justifyContent: "center",
+                fontSize: "18px", boxShadow: "0 0 20px #6366F144",
+              }
+            }, "🤖"),
+            React.createElement("div", null,
+              React.createElement("h1", { style: { margin: 0, fontSize: "18px", fontWeight: 800, color: "#C7D2FE" } }, "Tender Orchestrator"),
+              React.createElement("p", { style: { margin: 0, fontSize: "11px", color: "#6366F1" } },
+                config.userName ? `שלום ${config.userName}` : "מערכת ניהול מכרזים אוטומטית"
+              )
+            )
+          ),
+          React.createElement("div", { style: { display: "flex", alignItems: "center", gap: "8px" } },
+            updated && React.createElement("span", { style: { fontSize: "11px", color: "#475569" } }, `⏱ ${updated}`),
+            config.claudeApiKey && React.createElement("span", { style: { fontSize: "11px", color: "#10B981" } }, "🤖 API ✓"),
+            React.createElement("button", {
+              onClick: () => setShowSettings(true),
+              style: { background: "rgba(99,102,241,0.15)", border: "1px solid #312E81", color: "#A5B4FC", padding: "8px 14px", borderRadius: "8px", cursor: "pointer", fontSize: "13px" }
+            }, "⚙️ הגדרות"),
+            React.createElement("button", {
+              onClick: () => load(),
+              disabled: loading,
+              style: {
+                background: loading ? "#312E81" : "linear-gradient(135deg, #6366F1, #8B5CF6)",
+                border: "none", color: "#fff", padding: "8px 18px", borderRadius: "8px",
+                cursor: loading ? "wait" : "pointer", fontSize: "13px", fontWeight: 600,
+              }
+            }, loading ? "⏳" : "🔄 רענן")
+          )
+        ),
+
+        error && React.createElement("div", {
+          style: { margin: "12px 20px", padding: "12px 16px", background: "#7F1D1D22", border: "1px solid #7F1D1D", borderRadius: "8px", color: "#FCA5A5", fontSize: "13px" }
+        }, `⚠️ ${error}`),
+
+        React.createElement("div", { style: { padding: "0 20px", maxWidth: "1200px", margin: "0 auto" } },
+
+          /* First-time setup */
+          firstLoad && !loading ? React.createElement("div", {
+            style: { textAlign: "center", padding: "80px 20px", animation: "fadeIn 0.5s ease" }
+          },
+            React.createElement("div", { style: { fontSize: "60px", marginBottom: "20px" } }, "🤖"),
+            React.createElement("h2", { style: { color: "#C7D2FE", fontSize: "22px", marginBottom: "10px" } }, "!ברוך הבא ל-Tender Orchestrator"),
+            React.createElement("p", { style: { color: "#64748B", fontSize: "14px", marginBottom: "24px", maxWidth: "400px", margin: "0 auto 24px" } },
+              "כדי להתחיל, הגדר את קישורי Google Sheets ואת מפתח ה-Claude API שלך."
+            ),
+            React.createElement("button", {
+              onClick: () => setShowSettings(true),
+              style: {
+                background: "linear-gradient(135deg, #6366F1, #8B5CF6)",
+                border: "none", color: "#fff", padding: "14px 36px", borderRadius: "10px",
+                cursor: "pointer", fontSize: "16px", fontWeight: 700,
+                boxShadow: "0 4px 20px #6366F144",
+              }
+            }, "⚙️ פתח הגדרות")
+          ) :
+
+          React.createElement(React.Fragment, null,
+            /* TABS */
+            React.createElement("div", {
+              style: { display: "flex", gap: "2px", paddingTop: "10px", borderBottom: "1px solid #1E293B", overflowX: "auto" }
+            },
+              tabs.filter(t => t.key === "summary" || t.data?.()).map(t =>
+                React.createElement("button", {
+                  key: t.key,
+                  onClick: () => setTab(t.key),
+                  style: {
+                    background: tab === t.key ? "#312E8144" : "transparent",
+                    border: "none",
+                    borderBottom: tab === t.key ? "2px solid #818CF8" : "2px solid transparent",
+                    color: tab === t.key ? "#C7D2FE" : "#64748B",
+                    padding: "10px 16px", cursor: "pointer",
+                    fontSize: "13px", fontWeight: tab === t.key ? 700 : 400, whiteSpace: "nowrap",
+                  }
+                }, `${t.icon} ${t.label}`)
+              )
+            ),
+
+            /* CONTENT */
+            React.createElement("div", { style: { padding: "16px 0 40px" } },
+              loading ?
+                React.createElement("div", { style: { textAlign: "center", padding: "60px", color: "#64748B" } },
+                  React.createElement("div", { style: { fontSize: "40px", marginBottom: "12px", animation: "pulse 1.5s ease-in-out infinite" } }, "🤖"),
+                  React.createElement("p", null, "...טוען נתונים מ-Google Sheets")
+                )
+              : tab === "summary" ?
+                React.createElement("div", null,
+                  React.createElement("div", { style: { display: "flex", gap: "10px", padding: "14px 0", overflowX: "auto" } },
+                    React.createElement(StatCard, { icon: "📋", label: "מכרזים", value: tenders.length, color: "#818CF8" }),
+                    React.createElement(StatCard, { icon: "🆕", label: "חדשים", value: newCount, color: "#F59E0B" }),
+                    React.createElement(StatCard, { icon: "⏰", label: "דדליין קרוב", value: urgentCount, color: urgentCount > 0 ? "#EF4444" : "#10B981" }),
+                    React.createElement(StatCard, { icon: "📧", label: "שיעורים פתוחים", value: openLessons, color: openLessons > 0 ? "#F59E0B" : "#10B981" })
+                  ),
+                  tenders.length > 0 && React.createElement("div", { style: { marginTop: "16px" } },
+                    React.createElement("h3", { style: { fontSize: "14px", color: "#A5B4FC", marginBottom: "10px", fontWeight: 700 } }, "📋 מכרזים פעילים"),
+                    React.createElement(DataTable, { data: tender.tenders })
+                  ),
+                  lessons.length > 0 && React.createElement("div", { style: { marginTop: "20px" } },
+                    React.createElement("h3", { style: { fontSize: "14px", color: "#A5B4FC", marginBottom: "10px", fontWeight: 700 } }, "📧 יומן הדרכה — סוכן דואר"),
+                    React.createElement(DataTable, { data: training.mail_agent })
+                  )
+                )
+              :
+                React.createElement("div", null,
+                  React.createElement("h3", { style: { fontSize: "14px", color: "#A5B4FC", marginBottom: "12px", fontWeight: 700 } },
+                    `${tabs.find(t => t.key === tab)?.icon || ""} ${tabs.find(t => t.key === tab)?.label || ""}`
+                  ),
+                  React.createElement(DataTable, { data: tabs.find(t => t.key === tab)?.data?.() })
+                )
+            )
+          )
+        ),
+
+        /* FOOTER */
+        React.createElement("footer", {
+          style: { padding: "12px 20px", textAlign: "center", fontSize: "11px", color: "#334155", borderTop: "1px solid #1E293B" }
+        }, "Tender Orchestrator v3.0 — Google Sheets + Claude API")
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(App));
+  </script>
+</body>
+</html>
