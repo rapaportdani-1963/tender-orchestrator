@@ -427,10 +427,18 @@
               React.createElement("p", { style: { margin: 0, fontSize: "11px", color: "#6366F1" } }, settings.userName ? `שלום ${settings.userName}` : "מערכת ניהול מכרזים אוטומטית")
             )
           ),
-          React.createElement("div", { style: { display: "flex", alignItems: "center", gap: "8px" } },
+          React.createElement("div", { style: { display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap", justifyContent: "flex-end" } },
             updated && React.createElement("span", { style: { fontSize: "11px", color: "#475569" } }, `⏱ ${updated}`),
             hasKey ? React.createElement("span", { style: { fontSize: "11px", color: "#10B981" } }, "🔑 API ✓")
                    : React.createElement("span", { style: { fontSize: "11px", color: "#F59E0B" } }, "🔑 ללא API"),
+            settings.trainingLogId && React.createElement("button", {
+              onClick: () => window.open(`https://docs.google.com/spreadsheets/d/${settings.trainingLogId}/edit`, "_blank"),
+              style: { background: "rgba(245,158,11,0.12)", border: "1px solid rgba(245,158,11,0.3)", color: "#FBBF24", padding: "8px 12px", borderRadius: "8px", cursor: "pointer", fontSize: "12px" }
+            }, "📓 יומן הדרכה"),
+            settings.tenderDbId && React.createElement("button", {
+              onClick: () => window.open(`https://docs.google.com/spreadsheets/d/${settings.tenderDbId}/edit`, "_blank"),
+              style: { background: "rgba(6,182,212,0.12)", border: "1px solid rgba(6,182,212,0.3)", color: "#22D3EE", padding: "8px 12px", borderRadius: "8px", cursor: "pointer", fontSize: "12px" }
+            }, "📋 מסד מכרזים"),
             React.createElement("button", { onClick: () => setShowSettings(true), style: { background: "rgba(99,102,241,0.15)", border: "1px solid #312E81", color: "#A5B4FC", padding: "8px 14px", borderRadius: "8px", cursor: "pointer", fontSize: "13px" } }, "⚙️ הגדרות"),
             React.createElement("button", { onClick: () => load(), disabled: loading, style: { background: loading ? "#312E81" : "linear-gradient(135deg, #6366F1, #8B5CF6)", border: "none", color: "#fff", padding: "8px 18px", borderRadius: "8px", cursor: loading ? "wait" : "pointer", fontSize: "13px", fontWeight: 600 } }, loading ? "⏳" : "🔄 רענן")
           )
